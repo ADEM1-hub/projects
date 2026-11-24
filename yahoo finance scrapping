@@ -1,0 +1,111 @@
+
+
+library(httr2)
+library(rvest)
+library(xml2)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(tibble)
+
+dir.create("data_raw",   showWarnings = FALSE)
+dir.create("data_clean", showWarnings = FALSE)
+
+url <- "https://finance.yahoo.com/markets/"
+UA  <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+# ---------------------------------------------------------------------
+# 1. Download the page (one single request) and keep the raw HTML
+# ---------------------------------------------------------------------
+resp <- request(url) |>
+  req_user_agent(UA) |>
+  req_headers(`Accept-Language` = "en-US,en;q=0.9") |>
+  req_retry(max_tries = 3, backoff = \(i) 5 * i) |>
+  req_perform()
+
+scraped_at <- Sys.time()   # exact timestamp when the page was scraped
+page <- resp_body_html(resp)
+write_html(page, "data_raw/yahoo_markets_raw.html")   # reproducibility
+
+# ---------------------------------------------------------------------
+# 2. Parse every table that actually contains data.
+#    (Stocks / crypto / ETF / sector tables are filled by JavaScript, so
+#     they arrive empty and are dropped automatically.)
+# ---------------------------------------------------------------------
+parse_market_table <- function(tbl) {
+  raw <- html_table(tbl)
+  if (ncol(raw) < 4 || nrow(raw) == 0) return(NULL)
+
+  # ticker symbol comes from the link in the first column (/quote/%5EGSPC/)
+  hrefs <- tbl |> html_elements("tbody tr td:first-child a") |> html_attr("href")
+  symbol <- if (length(hrefs) == nrow(raw)) {
+    str_match(hrefs, "/quote/([^/]+)/")[, 2] |> map_chr(URLdecode)
+  } else {
+    rep(NA_character_, nrow(raw))
+  }
+
+  # Price cell looks like: "7,721.90   +45.13 (+0.59%)"
+  price_txt <- str_squish(as.character(raw[[3]]))
+  m <- str_match(price_txt,
+                 "^(-?[0-9,\\.]+)\\s+([+-]?[0-9,\\.]+)\\s*\\(([+-]?[0-9\\.]+)%\\)")
+
+  out <- tibble(
+    symbol     = symbol,
+    name       = str_squish(as.character(raw[[1]])),
+    price      = parse_number(m[, 2]),
+    change     = parse_number(m[, 3]),
+    change_pct = parse_number(as.character(raw[[4]]))
+  ) |>
+    filter(name != "", !is.na(price))
+
+  if (nrow(out) == 0) NULL else out
+}
+
+tables <- page |> html_elements("table") |> map(parse_market_table) |> compact()
+
+# Tables appear in this order on the page
+sections <- c("World Indices - Americas", "World Indices - Europe",
+              "World Indices - Asia", "Commodities", "Currencies",
+              "US Treasury Bonds")
+
+if (length(tables) != length(sections)) {
+  warning("Found ", length(tables), " data tables, expected ", length(sections),
+          ". Section labels may be wrong - check the raw HTML.")
+  sections <- paste0("table_", seq_along(tables))
+}
+
+# ---------------------------------------------------------------------
+# 3. Column-bind each standalone table with its scraped_at timestamp
+# ---------------------------------------------------------------------
+clean_names <- sections[seq_along(tables)] |>
+  str_to_lower() |>
+  str_replace_all("[^a-z0-9]+", "_") |>
+  str_remove_all("^_|_$")
+
+obj_names <- paste0("df_", clean_names)
+
+market_tables <- map(tables, \(t) {
+  bind_cols(t, scraped_at = scraped_at) |>
+    as.data.frame()
+}) |>
+  set_names(obj_names)
+
+# Export each table as its own standalone data.frame in the Global Environment
+list2env(market_tables, envir = .GlobalEnv)
+
+# Save, inspect, and view each table individually
+iwalk(market_tables, \(df, name) {
+  csv_name <- paste0(str_remove(name, "^df_"), ".csv")
+  write_csv(df, file.path("data_clean", csv_name))
+
+  cat("\n=====================================================================\n")
+  cat("Object:", name, "| Rows:", nrow(df), "| Columns:", ncol(df), "\n")
+  cat("=====================================================================\n")
+  print(df)
+
+  cat("\n% missing per column:\n")
+  print(round(colMeans(is.na(df)) * 100, 1))
+
+  if (interactive()) View(df, title = name)
+})
